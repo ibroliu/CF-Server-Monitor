@@ -504,46 +504,6 @@ function _ensureBatchFlush(env) {
   return flushingPromise;
 }
 
-// GeoIP 兜底：Cloudflare 未返回国家码时，用外部 GeoIP 接口识别并回填 servers.region
-// 结果按 IP 缓存在 D1（30 天），避免每次上报都请求外部接口；只填补空 region，手动设置的不覆盖
-const GEOIP_CACHE_TTL_MS = 30 * 24 * 3600 * 1000;
-
-async function fillRegionByGeoIp(env, serverId, ip) {
-  try {
-    await env.DB.prepare(
-      'CREATE TABLE IF NOT EXISTS geoip_cache (ip TEXT PRIMARY KEY, country TEXT NOT NULL, updated_at INTEGER NOT NULL)'
-    ).run();
-
-    const cached = await env.DB.prepare(
-      'SELECT country FROM geoip_cache WHERE ip = ? AND updated_at > ?'
-    ).bind(ip, Date.now() - GEOIP_CACHE_TTL_MS).first();
-    let country = String((cached && cached.country) || '').trim().toUpperCase();
-
-    if (!country) {
-      const resp = await fetch(`http://ip-api.com/json/${encodeURIComponent(ip)}?fields=status,countryCode`);
-      const data = await resp.json().catch(() => null);
-      if (data && data.status === 'success' && data.countryCode) {
-        country = String(data.countryCode).trim().toUpperCase();
-        await env.DB.prepare(
-          'INSERT INTO geoip_cache (ip, country, updated_at) VALUES (?, ?, ?) '
-          + 'ON CONFLICT(ip) DO UPDATE SET country = excluded.country, updated_at = excluded.updated_at'
-        ).bind(ip, country, Date.now()).run();
-      }
-    }
-
-    if (country) {
-      const res = await env.DB.prepare(
-        'UPDATE servers SET region = ? WHERE id = ? AND (region IS NULL OR region = \'\')'
-      ).bind(country, serverId).run();
-      if (res && res.meta && res.meta.changes > 0) {
-        patchServerDetailCache(serverId, { region: country });
-      }
-    }
-  } catch (e) {
-    // 兜底识别失败不影响上报主流程
-  }
-}
-
 export async function handleUpdate(request, env, ctx) {
   try {
     const data = await request.json();
@@ -553,23 +513,13 @@ export async function handleUpdate(request, env, ctx) {
       return createUnauthorizedResponse('Invalid secret');
     }
 
+    let regionCode = request.cf?.country || request.headers?.get('cf-ipcountry') || '';
+    const agentVersion = normalizeAgentVersion(request.headers.get('X-Agent-Version'));
+
     const serverDetail = await getServerDetail(env.DB, id, true);
 
     if (!serverDetail) {
       return createNotFoundResponse('Server not found');
-    }
-
-    const agentVersion = normalizeAgentVersion(request.headers.get('X-Agent-Version'));
-    const storedRegion = String(serverDetail.region || '').trim().toUpperCase();
-    let regionCode = request.cf?.country || request.headers?.get('cf-ipcountry') || storedRegion || '';
-
-    // Cloudflare 偶尔对云厂商 IP 段返回空国家码，此时用 GeoIP 兜底自动识别并回填
-    if (!regionCode) {
-      const clientIp = request.headers.get('CF-Connecting-IP')
-        || String(request.headers.get('X-Forwarded-For') || '').split(',')[0].trim();
-      if (clientIp) {
-        ctx.waitUntil(fillRegionByGeoIp(env, id, clientIp));
-      }
     }
 
     if (
